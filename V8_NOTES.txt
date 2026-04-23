@@ -1,0 +1,1 @@
+v8 debug build: added custom events debug sensor, verbose MQTT discovery logs, republish discovery after boot, version 3.0.39

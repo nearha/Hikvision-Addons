@@ -147,6 +147,7 @@ class MQTTHandler(EventHandler):
         self._unlock_event_discovery_topics: set[str] = set()
         self._ring_event_discovery_topics: set[str] = set()
         self._call_event_discovery_topics: set[str] = set()
+        self._event_discovery_state: dict[Doorbell, dict[str, bool]] = {}
         self._call_state_cache: dict[Doorbell, str] = {}
         self._active_call_sessions: dict[Doorbell, ActiveCallSession] = {}
         self._indoor_linked_outdoor_ip: dict[Doorbell, Optional[str]] = {}
@@ -171,13 +172,34 @@ class MQTTHandler(EventHandler):
             # Remove spaces and - from doorbell name
             sanitized_doorbell_name = sanitize_doorbell_name(doorbell_name)
             self._call_state_cache[doorbell] = "idle"
+            self._event_discovery_state[doorbell] = {"unlock": False, "ring": False, "call": False}
+
             custom_events_enabled = self._custom_events_enabled(doorbell)
             logger.info("Resolved outdoor/custom events for {} (type={}): {}", doorbell._config.name, getattr(doorbell._type, "name", doorbell._type), custom_events_enabled)
+
+            debug_sensor_info = SensorInfo(
+                name="Custom events debug",
+                unique_id=f"{device.identifiers}-custom_events_debug",
+                device=device,
+                default_entity_id=f"{sanitized_doorbell_name}_custom_events_debug",
+                icon="mdi:bug")
+            debug_settings = Settings(mqtt=self._mqtt_settings, entity=debug_sensor_info, manual_availability=True)
+            debug_sensor = Sensor(debug_settings)
+            debug_sensor.set_state("disabled")
+            debug_sensor.set_attributes({
+                "custom_events_enabled": custom_events_enabled,
+                "device_type": getattr(doorbell._type, "name", str(doorbell._type)),
+            })
+            debug_sensor.set_availability(True)
+            self._sensors[doorbell]['custom_events_debug'] = debug_sensor
+
             if custom_events_enabled:
                 logger.info("Custom MQTT event entities enabled for {}", doorbell._config.name)
+                debug_sensor.set_state("publishing_discovery")
                 self._ensure_unlock_event_entity(doorbell, device, sanitized_doorbell_name)
                 self._ensure_ring_event_entity(doorbell, device, sanitized_doorbell_name)
                 self._ensure_call_event_entity(doorbell, device, sanitized_doorbell_name)
+                self._update_custom_events_debug_sensor(doorbell)
 
             if doorbell._type is not DeviceType.OUTDOOR:
                 try:
@@ -296,6 +318,8 @@ class MQTTHandler(EventHandler):
             }
 
         try:
+            if topic.startswith("homeassistant/event/"):
+                logger.info("MQTT discovery publish -> topic={} retain={} payload={}", topic, retain, payload)
             mqtt_publish.single(
                 topic=topic,
                 payload=payload,
@@ -311,6 +335,39 @@ class MQTTHandler(EventHandler):
 
     def _unlock_event_topics(self, doorbell: Doorbell) -> tuple[str, str]:
         return self._event_topics(doorbell, "unlock")
+
+    def _update_custom_events_debug_sensor(self, doorbell: Doorbell) -> None:
+        sensor = self._sensors.get(doorbell, {}).get('custom_events_debug')
+        if sensor is None:
+            return
+        states = self._event_discovery_state.get(doorbell, {})
+        if all(states.get(key, False) for key in ("unlock", "ring", "call")):
+            state = "discovery_published"
+        elif any(states.values()):
+            state = "partial_discovery"
+        else:
+            state = "enabled_waiting"
+        sensor.set_state(state)
+        sensor.set_attributes({
+            "custom_events_enabled": self._custom_events_enabled(doorbell),
+            "device_type": getattr(doorbell._type, "name", str(doorbell._type)),
+            "unlock_discovery": states.get("unlock", False),
+            "ring_discovery": states.get("ring", False),
+            "call_discovery": states.get("call", False),
+            "unlock_topic": self._event_topics(doorbell, "unlock")[0],
+            "ring_topic": self._event_topics(doorbell, "ring")[0],
+            "call_topic": self._event_topics(doorbell, "call")[0],
+        })
+
+    def _republish_event_discovery(self, doorbell: Doorbell, event_key: str) -> None:
+        # brute-force republish retained discovery to help diagnose HA discovery issues
+        if event_key == "unlock":
+            self._ensure_unlock_event_entity(doorbell)
+        elif event_key == "ring":
+            self._ensure_ring_event_entity(doorbell)
+        elif event_key == "call":
+            self._ensure_call_event_entity(doorbell)
+
 
     def _ensure_unlock_event_entity(
         self,
@@ -502,7 +559,7 @@ class MQTTHandler(EventHandler):
         if image_path:
             payload["image_path"] = image_path
         self._mqtt_publish(state_topic, json.dumps(payload), retain=False)
-        logger.debug("Published ring event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
+        logger.info("Published ring event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
 
     def publish_call_event(
         self,
@@ -513,7 +570,7 @@ class MQTTHandler(EventHandler):
         _, state_topic = self._call_event_topics(doorbell)
         payload = {"event_type": _CALL_EVENT_TYPE, **payload}
         self._mqtt_publish(state_topic, json.dumps(payload), retain=False)
-        logger.debug("Published call event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
+        logger.info("Published call event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
 
     async def _publish_ring_event_for_session(self, doorbell: Doorbell, session: ActiveCallSession) -> None:
         if session.ring_event_published:
@@ -612,7 +669,7 @@ class MQTTHandler(EventHandler):
             session.unlock_type = unlock_name
             session.unlock_number = normalized_number
         self._mqtt_publish(state_topic, json.dumps(payload), retain=False)
-        logger.debug("Published unlock event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
+        logger.info("Published unlock event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
 
     def _event_topics(self, doorbell: Doorbell, event_key: str) -> tuple[str, str]:
         sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
@@ -643,11 +700,13 @@ class MQTTHandler(EventHandler):
 
         config_payload = {
             "name": f"{doorbell._config.name} {display_name}",
+            "platform": "event",
             "default_entity_id": f"{sanitized_doorbell_name}_{event_key}",
             "unique_id": f"{device.identifiers}-{unique_suffix}",
             "state_topic": state_topic,
             "event_types": event_types,
             "icon": icon,
+            "qos": 0,
             "device": {
                 "identifiers": [device.identifiers],
                 "name": device.name,
@@ -661,7 +720,12 @@ class MQTTHandler(EventHandler):
         logger.info("Publishing {} event discovery for {} to {} with payload {}", event_key, doorbell._config.name, discovery_topic, config_payload)
         self._mqtt_publish(discovery_topic, json.dumps(config_payload), retain=True)
         discovery_topics_cache.add(discovery_topic)
+        self._event_discovery_state.setdefault(doorbell, {})[event_key] = True
+        self._update_custom_events_debug_sensor(doorbell)
         logger.info("Published {} event discovery for {} to {}", event_key, doorbell._config.name, discovery_topic)
+
+        loop = asyncio.get_event_loop()
+        loop.call_later(10, lambda d=doorbell, k=event_key: self._republish_event_discovery(d, k))
 
     def com_switch_callback(self, client, user_data: tuple[Doorbell, int], message: MQTTMessage):
         doorbell, com_id = user_data
