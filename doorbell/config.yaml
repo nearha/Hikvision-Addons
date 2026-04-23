@@ -1,10 +1,12 @@
-name: Hikvision Doorbell Fork
-description: Lean fork with unlock/ring/call MQTT events
-version: '3.0.36'
+name: Hikvision Doorbell
+description: Connect your Hikvision doorbells to Home Assistant
+version: '3.0.37'
+image: ghcr.io/pergolafabio/hikvision-doorbell
 slug: hikvision_doorbell
 url: https://github.com/pergolafabio/Hikvision-Addons/tree/main/doorbell
 arch:
 - amd64
+- i386
 - aarch64
 stage: stable
 startup: application
@@ -23,7 +25,6 @@ options:
       username: admin
       password: ""
       scenes: false
-      outdoor_events: false
   system:
     log_level: INFO
     sdk_log_level: NONE
@@ -39,7 +40,6 @@ schema:
       password: str
       output_relays: "int?"
       scenes: "bool?"
-      outdoor_events: "bool?"
       call_state_poll: "int?"
   system:
     log_level: match(^ERROR|WARNING|INFO|DEBUG$)
