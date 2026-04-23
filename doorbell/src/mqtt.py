@@ -171,7 +171,9 @@ class MQTTHandler(EventHandler):
             # Remove spaces and - from doorbell name
             sanitized_doorbell_name = sanitize_doorbell_name(doorbell_name)
             self._call_state_cache[doorbell] = "idle"
-            if self._custom_events_enabled(doorbell):
+            custom_events_enabled = self._custom_events_enabled(doorbell)
+            logger.info("Resolved outdoor/custom events for {} (type={}): {}", doorbell._config.name, getattr(doorbell._type, "name", doorbell._type), custom_events_enabled)
+            if custom_events_enabled:
                 logger.info("Custom MQTT event entities enabled for {}", doorbell._config.name)
                 self._ensure_unlock_event_entity(doorbell, device, sanitized_doorbell_name)
                 self._ensure_ring_event_entity(doorbell, device, sanitized_doorbell_name)
@@ -280,7 +282,10 @@ class MQTTHandler(EventHandler):
                     self._sensors[doorbell][f'com_{com_id}'] = com_switch
 
     def _custom_events_enabled(self, doorbell: Doorbell) -> bool:
-        return bool(getattr(doorbell._config, "outdoor_events", False))
+        configured = getattr(doorbell._config, "outdoor_events", None)
+        if doorbell._type is DeviceType.OUTDOOR:
+            return configured is not False
+        return bool(configured)
 
     def _mqtt_publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0):
         auth: Optional[dict[str, str]] = None
@@ -611,7 +616,7 @@ class MQTTHandler(EventHandler):
 
     def _event_topics(self, doorbell: Doorbell, event_key: str) -> tuple[str, str]:
         sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
-        discovery_topic = f"homeassistant/event/{sanitized_doorbell_name}/{event_key}/config"
+        discovery_topic = f"homeassistant/event/{sanitized_doorbell_name}_{event_key}/config"
         state_topic = f"hikvision/{sanitized_doorbell_name}/{event_key}/event"
         return discovery_topic, state_topic
 
@@ -637,9 +642,8 @@ class MQTTHandler(EventHandler):
             sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
 
         config_payload = {
-            "platform": "event",
             "name": f"{doorbell._config.name} {display_name}",
-            "object_id": f"{sanitized_doorbell_name}_{event_key}",
+            "default_entity_id": f"{sanitized_doorbell_name}_{event_key}",
             "unique_id": f"{device.identifiers}-{unique_suffix}",
             "state_topic": state_topic,
             "event_types": event_types,
@@ -654,6 +658,7 @@ class MQTTHandler(EventHandler):
             },
         }
 
+        logger.info("Publishing {} event discovery for {} to {} with payload {}", event_key, doorbell._config.name, discovery_topic, config_payload)
         self._mqtt_publish(discovery_topic, json.dumps(config_payload), retain=True)
         discovery_topics_cache.add(discovery_topic)
         logger.info("Published {} event discovery for {} to {}", event_key, doorbell._config.name, discovery_topic)
