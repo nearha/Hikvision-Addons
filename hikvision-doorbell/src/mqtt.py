@@ -629,9 +629,9 @@ class MQTTHandler(EventHandler):
 
         config_payload = {
             "platform": "event",
-            "name": display_name,
+            "name": f"{doorbell._config.name} {display_name}",
+            "object_id": f"{sanitized_doorbell_name}_{event_key}",
             "unique_id": f"{device.identifiers}-{unique_suffix}",
-            "default_entity_id": f"{sanitized_doorbell_name}_{event_key}",
             "state_topic": state_topic,
             "event_types": event_types,
             "icon": icon,
@@ -647,7 +647,7 @@ class MQTTHandler(EventHandler):
 
         self._mqtt_publish(discovery_topic, json.dumps(config_payload), retain=True)
         discovery_topics_cache.add(discovery_topic)
-        logger.debug("Published {} event discovery for {} to {}", event_key, doorbell._config.name, discovery_topic)
+        logger.info("Published {} event discovery for {} to {}", event_key, doorbell._config.name, discovery_topic)
 
     def com_switch_callback(self, client, user_data: tuple[Doorbell, int], message: MQTTMessage):
         doorbell, com_id = user_data
