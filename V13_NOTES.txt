@@ -1,0 +1,7 @@
+V13 changes
+- Removed MQTT debug helper sensor/entity creation.
+- Removed manual debug sensor discovery.
+- Kept MQTT device discovery for unlock/ring/call events.
+- call_event still includes had_ring and unlock_number.
+- ring caller now normalizes indoor names to trailing digits when present (e.g. 'Tela 4' -> '4').
+- Version bumped to 3.0.44.
