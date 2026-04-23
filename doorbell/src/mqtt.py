@@ -173,6 +173,7 @@ class MQTTHandler(EventHandler):
             sanitized_doorbell_name = sanitize_doorbell_name(doorbell_name)
             self._call_state_cache[doorbell] = "idle"
             self._event_discovery_state[doorbell] = {"unlock": False, "ring": False, "call": False}
+            self._cleanup_legacy_debug_discovery(sanitized_doorbell_name)
 
             custom_events_enabled = self._custom_events_enabled(doorbell)
             logger.info("Resolved outdoor/custom events for {} (type={}): {}", doorbell._config.name, getattr(doorbell._type, "name", doorbell._type), custom_events_enabled)
@@ -374,6 +375,18 @@ class MQTTHandler(EventHandler):
         self._ensure_custom_event_device_discovery(doorbell, device, sanitized_doorbell_name)
 
 
+    def _cleanup_legacy_debug_discovery(self, sanitized_doorbell_name: str) -> None:
+        legacy_topics = [
+            f"homeassistant/sensor/{sanitized_doorbell_name}_manual_mqtt_debug/config",
+            f"homeassistant/sensor/{sanitized_doorbell_name}_custom_events_debug/config",
+        ]
+        for topic in legacy_topics:
+            try:
+                self._mqtt_publish(topic, "", retain=True)
+                logger.info("Cleared legacy MQTT discovery topic {}", topic)
+            except Exception as e:
+                logger.warning("Could not clear legacy MQTT discovery topic {}: {}", topic, e)
+
     def _custom_event_device_discovery_topic(self, doorbell: Doorbell) -> str:
         sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
         return f"homeassistant/device/{sanitized_doorbell_name}/config"
@@ -405,7 +418,7 @@ class MQTTHandler(EventHandler):
             },
             "origin": {
                 "name": "hikvision-doorbell-fork",
-                "sw_version": "3.0.44",
+                "sw_version": "3.0.45",
             },
             "components": {
                 "unlock_event": {
@@ -546,13 +559,7 @@ class MQTTHandler(EventHandler):
             return None
 
     def _normalize_caller_name(self, name: str) -> str:
-        normalized = (name or "").strip()
-        if not normalized:
-            return normalized
-        match = re.search(r"(\d+)$", normalized)
-        if match:
-            return match.group(1)
-        return normalized
+        return (name or "").strip()
 
     def _format_caller_names(self, callers: list[str]) -> Optional[str]:
         if not callers:

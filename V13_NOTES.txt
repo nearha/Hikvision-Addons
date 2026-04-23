@@ -5,3 +5,5 @@ V13 changes
 - call_event still includes had_ring and unlock_number.
 - ring caller now normalizes indoor names to trailing digits when present (e.g. 'Tela 4' -> '4').
 - Version bumped to 3.0.44.
+
+V14 changes: remove caller conversion and clear legacy debug MQTT discovery topics.
