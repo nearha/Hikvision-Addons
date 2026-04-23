@@ -1,6 +1,6 @@
 name: Hikvision Doorbell Fork
 description: Lean fork with unlock/ring/call MQTT events
-version: '3.0.45'
+version: '3.0.39'
 slug: hikvision_doorbell
 url: https://github.com/pergolafabio/Hikvision-Addons/tree/main/doorbell
 arch:
