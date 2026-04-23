@@ -1,3 +1,0 @@
-# Configure the linter, set a more reasonable max-line-length than its default
-[flake8]
-max-line-length=160
