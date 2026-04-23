@@ -1,11 +1,12 @@
 import asyncio
 import os
-from ctypes import c_void_p
+from ctypes import c_void_p, string_at
 from typing import Any, Optional, TypedDict, cast
 from config import AppConfig
 from doorbell import DeviceType, Doorbell, Registry, sanitize_doorbell_name
 from event import EventHandler
 from paho.mqtt.client import MQTTMessage
+from paho.mqtt import publish as mqtt_publish
 from ha_mqtt_discoverable import Settings, DeviceInfo, Discoverable
 from ha_mqtt_discoverable.sensors import BinarySensor, BinarySensorInfo, SensorInfo, Sensor, SwitchInfo, Switch, DeviceTrigger, DeviceTriggerInfo
 from loguru import logger
@@ -26,10 +27,32 @@ from typing_extensions import override
 import xml.etree.ElementTree as ET
 import json
 import datetime
+from dataclasses import dataclass
+from pathlib import Path
 
 from sdk.utils import SDKError
 
 _current_mqtt_handler = None
+_UNLOCK_EVENT_TYPE = "unlocked"
+_RING_EVENT_TYPE = "ring"
+_CALL_EVENT_TYPE = "call_completed"
+_HOUSEHOLDER_PREFIX = "1001011"
+_DEFAULT_CALL_STATE_POLL = 1
+_ACTIVE_CALL_STATES = {"ring", "onCall"}
+
+
+@dataclass
+class ActiveCallSession:
+    ring_started_at: datetime.datetime
+    caller: Optional[str] = None
+    ring_snapshot_path: Optional[str] = None
+    ring_event_published: bool = False
+    oncall_started_at: Optional[datetime.datetime] = None
+    was_answered: bool = False
+    unlock_performed: bool = False
+    unlock_type: Optional[str] = None
+    unlock_number: Optional[str] = None
+
 
 def extract_device_info(doorbell: Doorbell) -> DeviceInfo:
     """Build and instance of DeviceInfo from the ISAPI /deviceinfo endpoint, if available, otherwise skip populating additional fields"""
@@ -121,6 +144,12 @@ class MQTTHandler(EventHandler):
 
         # Initialize task storage at the start
         self._call_sensor_tasks: dict[Doorbell, asyncio.Task] = {}
+        self._unlock_event_discovery_topics: set[str] = set()
+        self._ring_event_discovery_topics: set[str] = set()
+        self._call_event_discovery_topics: set[str] = set()
+        self._call_state_cache: dict[Doorbell, str] = {}
+        self._active_call_sessions: dict[Doorbell, ActiveCallSession] = {}
+        self._indoor_linked_outdoor_ip: dict[Doorbell, Optional[str]] = {}
         
         # Save the MQTT settings as an attribute
         self._mqtt_settings = Settings.MQTT(
@@ -141,6 +170,17 @@ class MQTTHandler(EventHandler):
 
             # Remove spaces and - from doorbell name
             sanitized_doorbell_name = sanitize_doorbell_name(doorbell_name)
+            self._call_state_cache[doorbell] = "idle"
+            if doorbell._type is DeviceType.OUTDOOR:
+                self._ensure_unlock_event_entity(doorbell, device, sanitized_doorbell_name)
+                self._ensure_ring_event_entity(doorbell, device, sanitized_doorbell_name)
+                self._ensure_call_event_entity(doorbell, device, sanitized_doorbell_name)
+            else:
+                try:
+                    self._indoor_linked_outdoor_ip[doorbell] = doorbell.get_outdoor_ip()
+                except Exception as e:
+                    logger.warning("Could not resolve linked outdoor IP for {}: {}", doorbell._config.name, e)
+                    self._indoor_linked_outdoor_ip[doorbell] = None
 
             # No Callsensor for indoor
             # if not doorbell._type is DeviceType.INDOOR:
@@ -160,42 +200,41 @@ class MQTTHandler(EventHandler):
             call_sensor.set_availability(True)
             self._sensors[doorbell]['call'] = call_sensor
 
-            # If polling is defined, create a loop to update the call state periodically
+            # Poll call state for all devices. If not configured, default to 1 second.
+            call_state_poll_sec = doorbell._config.call_state_poll or _DEFAULT_CALL_STATE_POLL
 
-            if not doorbell._config.call_state_poll is None:
+            async def poll_call_sensor(d=doorbell, c=call_sensor):
+                url = "/ISAPI/VideoIntercom/callStatus?format=json"
+                requestBody = ""
+                while True:
+                    try:
+                        logger.debug("Trying to get call status for doorbell: {} every {} sec", d._config.name, call_state_poll_sec)
+                        response = d._call_isapi("GET", url, requestBody)
+                        data = json.loads(response)
 
-                call_state_poll_sec = doorbell._config.call_state_poll
-
-                async def poll_call_sensor(d=doorbell, c=call_sensor):
-
-                    url = "/ISAPI/VideoIntercom/callStatus?format=json"
-                    requestBody = ""
-                    while True:
-                        try:
-                            logger.debug("Trying to get call status for doorbell: {} every {} sec", d._config.name, call_state_poll_sec)
-                            response = d._call_isapi("GET", url, requestBody)
-                            data = json.loads(response)
-                            
-                            # Use .get() to avoid KeyErrors if the device returns an error object
-                            call_status_obj = data.get("CallStatus")
-                            if call_status_obj:
-                                call_state = call_status_obj.get("status")
-                                if call_state:
-                                    c.set_state(call_state)
+                        call_status_obj = data.get("CallStatus")
+                        if call_status_obj:
+                            call_state = call_status_obj.get("status")
+                            if call_state:
+                                previous_state = self._call_state_cache.get(d, "idle")
+                                c.set_state(call_state)
+                                self._call_state_cache[d] = call_state
+                                await self._process_call_state_change(d, previous_state, call_state)
+                                if previous_state != call_state:
                                     logger.info("Call sensor polling for : {} changed to {}", d._config.name, call_state)
-                            else:
-                                logger.warning("Unexpected ISAPI response from {}: {}", d._config.name, response)
-                                
-                        except (SDKError, json.JSONDecodeError) as err:
-                            logger.error("Communication error with {}: {}", d._config.name, err)
-                        except Exception as e:
-                            logger.exception("Unexpected error in polling loop: {}", e)
-                            
-                        await asyncio.sleep(call_state_poll_sec)
-                        
-                loop = asyncio.get_event_loop()
-                self._call_sensor_tasks[doorbell] = loop.create_task(poll_call_sensor())
-                
+                        else:
+                            logger.warning("Unexpected ISAPI response from {}: {}", d._config.name, response)
+
+                    except (SDKError, json.JSONDecodeError) as err:
+                        logger.error("Communication error with {}: {}", d._config.name, err)
+                    except Exception as e:
+                        logger.exception("Unexpected error in polling loop: {}", e)
+
+                    await asyncio.sleep(call_state_poll_sec)
+
+            loop = asyncio.get_event_loop()
+            self._call_sensor_tasks[doorbell] = loop.create_task(poll_call_sensor())
+
             ##################
             # Doors
             # Create switches for output relays used to open doors
@@ -237,6 +276,378 @@ class MQTTHandler(EventHandler):
                     com_switch.off()
                     com_switch.set_availability(True)
                     self._sensors[doorbell][f'com_{com_id}'] = com_switch
+
+    def _mqtt_publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0):
+        auth: Optional[dict[str, str]] = None
+        if self._mqtt_settings.username is not None:
+            auth = {
+                "username": self._mqtt_settings.username,
+                "password": self._mqtt_settings.password or "",
+            }
+
+        mqtt_publish.single(
+            topic=topic,
+            payload=payload,
+            qos=qos,
+            retain=retain,
+            hostname=self._mqtt_settings.host,
+            port=self._mqtt_settings.port,
+            auth=auth,
+        )
+
+    def _unlock_event_topics(self, doorbell: Doorbell) -> tuple[str, str]:
+        return self._event_topics(doorbell, "unlock")
+
+    def _ensure_unlock_event_entity(
+        self,
+        doorbell: Doorbell,
+        device: Optional[DeviceInfo] = None,
+        sanitized_doorbell_name: Optional[str] = None,
+    ) -> None:
+        self._ensure_mqtt_event_entity(
+            doorbell=doorbell,
+            event_key="unlock",
+            display_name="Unlock",
+            unique_suffix="unlock_event",
+            icon="mdi:door-open",
+            event_types=[_UNLOCK_EVENT_TYPE],
+            discovery_topics_cache=self._unlock_event_discovery_topics,
+            device=device,
+            sanitized_doorbell_name=sanitized_doorbell_name,
+        )
+
+    def _ring_event_topics(self, doorbell: Doorbell) -> tuple[str, str]:
+        return self._event_topics(doorbell, "ring")
+
+    def _ensure_ring_event_entity(
+        self,
+        doorbell: Doorbell,
+        device: Optional[DeviceInfo] = None,
+        sanitized_doorbell_name: Optional[str] = None,
+    ) -> None:
+        self._ensure_mqtt_event_entity(
+            doorbell=doorbell,
+            event_key="ring",
+            display_name="Ring",
+            unique_suffix="ring_event",
+            icon="mdi:bell-ring",
+            event_types=[_RING_EVENT_TYPE],
+            discovery_topics_cache=self._ring_event_discovery_topics,
+            device=device,
+            sanitized_doorbell_name=sanitized_doorbell_name,
+        )
+
+    def _call_event_topics(self, doorbell: Doorbell) -> tuple[str, str]:
+        return self._event_topics(doorbell, "call")
+
+    def _ensure_call_event_entity(
+        self,
+        doorbell: Doorbell,
+        device: Optional[DeviceInfo] = None,
+        sanitized_doorbell_name: Optional[str] = None,
+    ) -> None:
+        self._ensure_mqtt_event_entity(
+            doorbell=doorbell,
+            event_key="call",
+            display_name="Call",
+            unique_suffix="call_event",
+            icon="mdi:phone-in-talk",
+            event_types=[_CALL_EVENT_TYPE],
+            discovery_topics_cache=self._call_event_discovery_topics,
+            device=device,
+            sanitized_doorbell_name=sanitized_doorbell_name,
+        )
+
+    def _normalize_unlock_number(self, unlock_name: str, control_source_decoded: str) -> Optional[str]:
+        raw_value = (control_source_decoded or "").strip()
+
+        if unlock_name == "HOUSEHOLDER":
+            prefix_index = raw_value.find(_HOUSEHOLDER_PREFIX)
+            if prefix_index != -1:
+                suffix = raw_value[prefix_index + len(_HOUSEHOLDER_PREFIX):]
+                if suffix.isdigit() and suffix != "":
+                    try:
+                        return str(int(suffix))
+                    except ValueError:
+                        return raw_value
+            return raw_value or None
+
+        if unlock_name == "CENTER_PLATFORM":
+            return None
+
+        return raw_value or None
+
+    def _save_unlock_event_image(self, doorbell: Doorbell, door_id: int, unlock_name: str, image_data: bytes) -> Optional[str]:
+        if not image_data:
+            return None
+
+        try:
+            base_path = Path("/media/hikvision") if os.path.isdir("/media") else Path.home() / "hikvision"
+            output_dir = base_path / sanitize_doorbell_name(doorbell._config.name) / "unlock"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"unlock_{timestamp}_door{door_id + 1}_{unlock_name.lower()}.jpg"
+            file_path = output_dir / filename
+
+            with open(file_path, "wb") as f:
+                f.write(image_data)
+
+            logger.info("Unlock event image saved: {}", file_path)
+
+            try:
+                from mqtt_input import get_mqtt_input
+
+                mqtt_input = get_mqtt_input()
+                if mqtt_input:
+                    mqtt_input._last_snapshot_paths[doorbell] = str(file_path)
+                    mqtt_input._publish_snapshot_image(doorbell, str(file_path))
+                    logger.debug("Published unlock event image to snapshot entity for {}", doorbell._config.name)
+            except Exception as e:
+                logger.warning("Could not publish unlock image to MQTT image entity for {}: {}", doorbell._config.name, e)
+
+            return str(file_path)
+        except Exception as e:
+            logger.error("Failed to save unlock event image for {}: {}", doorbell._config.name, e)
+            return None
+
+    def _save_ring_event_image(self, doorbell: Doorbell, image_data: bytes) -> Optional[str]:
+        if not image_data:
+            return None
+
+        try:
+            base_path = Path("/media/hikvision") if os.path.isdir("/media") else Path.home() / "hikvision"
+            output_dir = base_path / sanitize_doorbell_name(doorbell._config.name) / "ring"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            file_path = output_dir / f"ring_{timestamp}.jpg"
+            with open(file_path, "wb") as f:
+                f.write(image_data)
+
+            logger.info("Ring event image saved: {}", file_path)
+            try:
+                from mqtt_input import get_mqtt_input
+
+                mqtt_input = get_mqtt_input()
+                if mqtt_input:
+                    mqtt_input._last_snapshot_paths[doorbell] = str(file_path)
+                    mqtt_input._publish_snapshot_image(doorbell, str(file_path))
+            except Exception as e:
+                logger.warning("Could not publish ring image to MQTT image entity for {}: {}", doorbell._config.name, e)
+            return str(file_path)
+        except Exception as e:
+            logger.error("Failed to save ring event image for {}: {}", doorbell._config.name, e)
+            return None
+
+    def _capture_snapshot_for_ring(self, doorbell: Doorbell) -> Optional[str]:
+        try:
+            snapshot_path = doorbell.take_snapshot()
+            if snapshot_path and os.path.exists(snapshot_path):
+                with open(snapshot_path, "rb") as f:
+                    return self._save_ring_event_image(doorbell, f.read())
+            return snapshot_path
+        except Exception as e:
+            logger.error("Failed to capture ring snapshot for {}: {}", doorbell._config.name, e)
+            return None
+
+    def _format_caller_names(self, callers: list[str]) -> Optional[str]:
+        if not callers:
+            return None
+        deduped = list(dict.fromkeys([caller for caller in callers if caller]))
+        if not deduped:
+            return None
+        return ",".join(deduped)
+
+    def _get_related_indoors(self, outdoor: Doorbell) -> list[Doorbell]:
+        related = []
+        for candidate, linked_ip in self._indoor_linked_outdoor_ip.items():
+            if linked_ip and linked_ip == outdoor._config.ip:
+                related.append(candidate)
+        return related
+
+    def _resolve_callers_for_outdoor(self, outdoor: Doorbell) -> list[str]:
+        callers: list[str] = []
+        for indoor in self._get_related_indoors(outdoor):
+            state = self._call_state_cache.get(indoor, "idle")
+            if state in _ACTIVE_CALL_STATES:
+                callers.append(indoor._config.name)
+        return callers
+
+    def publish_ring_event(
+        self,
+        doorbell: Doorbell,
+        caller: Optional[str],
+        image_path: Optional[str],
+    ) -> None:
+        self._ensure_ring_event_entity(doorbell)
+        _, state_topic = self._ring_event_topics(doorbell)
+        payload: dict[str, Any] = {"event_type": _RING_EVENT_TYPE}
+        if caller:
+            payload["caller"] = caller
+        if image_path:
+            payload["image_path"] = image_path
+        self._mqtt_publish(state_topic, json.dumps(payload), retain=False)
+        logger.debug("Published ring event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
+
+    def publish_call_event(
+        self,
+        doorbell: Doorbell,
+        payload: dict[str, Any],
+    ) -> None:
+        self._ensure_call_event_entity(doorbell)
+        _, state_topic = self._call_event_topics(doorbell)
+        payload = {"event_type": _CALL_EVENT_TYPE, **payload}
+        self._mqtt_publish(state_topic, json.dumps(payload), retain=False)
+        logger.debug("Published call event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
+
+    async def _publish_ring_event_for_session(self, doorbell: Doorbell, session: ActiveCallSession) -> None:
+        if session.ring_event_published:
+            return
+
+        loop = asyncio.get_running_loop()
+        image_path = await loop.run_in_executor(None, self._capture_snapshot_for_ring, doorbell)
+        if image_path:
+            session.ring_snapshot_path = image_path
+
+        caller_names: list[str] = []
+        for _ in range(3):
+            caller_names = self._resolve_callers_for_outdoor(doorbell)
+            if caller_names:
+                break
+            await asyncio.sleep(_DEFAULT_CALL_STATE_POLL)
+
+        session.caller = self._format_caller_names(caller_names)
+        self.publish_ring_event(doorbell, session.caller, session.ring_snapshot_path)
+        session.ring_event_published = True
+
+    async def _process_call_state_change(self, doorbell: Doorbell, previous_state: str, current_state: str) -> None:
+        if doorbell._type is DeviceType.OUTDOOR:
+            session = self._active_call_sessions.get(doorbell)
+
+            if previous_state == current_state:
+                return
+
+            if previous_state == "idle" and current_state in _ACTIVE_CALL_STATES:
+                session = ActiveCallSession(ring_started_at=datetime.datetime.now())
+                if current_state == "onCall":
+                    session.oncall_started_at = session.ring_started_at
+                    session.was_answered = True
+                self._active_call_sessions[doorbell] = session
+                asyncio.create_task(self._publish_ring_event_for_session(doorbell, session))
+            elif session and current_state == "onCall" and session.oncall_started_at is None:
+                session.oncall_started_at = datetime.datetime.now()
+                session.was_answered = True
+
+            session = self._active_call_sessions.get(doorbell)
+            if session:
+                caller_names = self._resolve_callers_for_outdoor(doorbell)
+                formatted_callers = self._format_caller_names(caller_names)
+                if formatted_callers:
+                    session.caller = formatted_callers
+
+                if current_state == "idle" and previous_state in _ACTIVE_CALL_STATES:
+                    duration_base = session.oncall_started_at or session.ring_started_at
+                    duration_seconds = max(0, int((datetime.datetime.now() - duration_base).total_seconds()))
+                    result = "answered" if session.was_answered else "not_answered"
+                    call_payload: dict[str, Any] = {
+                        "result": result,
+                        "duration": f"{duration_seconds}s",
+                        "duration_seconds": duration_seconds,
+                        "unlock_realizado": session.unlock_performed,
+                    }
+                    if session.caller:
+                        call_payload["caller"] = session.caller
+                    if session.ring_snapshot_path:
+                        call_payload["image_path"] = session.ring_snapshot_path
+                    if session.unlock_performed:
+                        call_payload["unlock_type"] = session.unlock_type
+                        call_payload["unlock_number"] = session.unlock_number
+                    self.publish_call_event(doorbell, call_payload)
+                    self._active_call_sessions.pop(doorbell, None)
+
+        else:
+            for outdoor, session in self._active_call_sessions.items():
+                caller_names = self._resolve_callers_for_outdoor(outdoor)
+                formatted_callers = self._format_caller_names(caller_names)
+                if formatted_callers:
+                    session.caller = formatted_callers
+
+    def publish_unlock_event(
+        self,
+        doorbell: Doorbell,
+        door_id: int,
+        unlock_name: str,
+        control_source_decoded: str,
+        image_path: Optional[str] = None,
+    ) -> None:
+        self._ensure_unlock_event_entity(doorbell)
+        _, state_topic = self._unlock_event_topics(doorbell)
+        normalized_number = self._normalize_unlock_number(unlock_name, control_source_decoded)
+        payload = {
+            "event_type": _UNLOCK_EVENT_TYPE,
+            "unlock_type": unlock_name,
+            "number": normalized_number,
+            "door_id": door_id + 1,
+        }
+        if image_path:
+            payload["image_path"] = image_path
+        session = self._active_call_sessions.get(doorbell)
+        if session:
+            session.unlock_performed = True
+            session.unlock_type = unlock_name
+            session.unlock_number = normalized_number
+        self._mqtt_publish(state_topic, json.dumps(payload), retain=False)
+        logger.debug("Published unlock event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
+
+    def _event_topics(self, doorbell: Doorbell, event_key: str) -> tuple[str, str]:
+        sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
+        discovery_topic = f"homeassistant/event/{sanitized_doorbell_name}/{event_key}/config"
+        state_topic = f"hikvision/{sanitized_doorbell_name}/{event_key}/event"
+        return discovery_topic, state_topic
+
+    def _ensure_mqtt_event_entity(
+        self,
+        doorbell: Doorbell,
+        event_key: str,
+        display_name: str,
+        unique_suffix: str,
+        icon: str,
+        event_types: list[str],
+        discovery_topics_cache: set[str],
+        device: Optional[DeviceInfo] = None,
+        sanitized_doorbell_name: Optional[str] = None,
+    ) -> None:
+        discovery_topic, state_topic = self._event_topics(doorbell, event_key)
+        if discovery_topic in discovery_topics_cache:
+            return
+
+        if device is None:
+            device = extract_device_info(doorbell)
+        if sanitized_doorbell_name is None:
+            sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
+
+        config_payload = {
+            "platform": "event",
+            "name": display_name,
+            "unique_id": f"{device.identifiers}-{unique_suffix}",
+            "default_entity_id": f"{sanitized_doorbell_name}_{event_key}",
+            "state_topic": state_topic,
+            "event_types": event_types,
+            "icon": icon,
+            "device": {
+                "identifiers": [device.identifiers],
+                "name": device.name,
+                "manufacturer": device.manufacturer,
+                "model": device.model,
+                "sw_version": device.sw_version,
+                "hw_version": device.hw_version,
+            },
+        }
+
+        self._mqtt_publish(discovery_topic, json.dumps(config_payload), retain=True)
+        discovery_topics_cache.add(discovery_topic)
+        logger.debug("Published {} event discovery for {} to {}", event_key, doorbell._config.name, discovery_topic)
 
     def com_switch_callback(self, client, user_data: tuple[Doorbell, int], message: MQTTMessage):
         doorbell, com_id = user_data
@@ -357,23 +768,27 @@ class MQTTHandler(EventHandler):
             buffer_length,
             user_pointer: c_void_p):
 
-        async def update_door_entities(door_id: str, control_source: str, control_source_decoded: str, unlock_name: str, card_user_id: int):
+        async def update_door_entities(door_id: int, unlock_name: str, control_source_decoded: str, image_path: Optional[str]):
             """
-            Helper function to update the sensor and device trigger of a given door
+            Helper function to update the relay switch of a given door and publish the unlock event.
             """
-            logger.info("Door {} unlocked by {} , updating sensor and device trigger", door_id+1, control_source)
+            logger.info("Door {} unlocked, updating relay switch and unlock event", door_id + 1)
             entity_id = f'door_{door_id}'
             door_sensor = cast(Switch, self._sensors[doorbell].get(entity_id))
-            attributes = {
-                'control_source': control_source,
-                'number': control_source_decoded,
+
+            event_attributes = {
                 'unlock_type': unlock_name,
-                'card_user_id': card_user_id,
+                'number': self._normalize_unlock_number(unlock_name, control_source_decoded),
+                'door_id': door_id + 1,
             }
-            door_sensor.set_attributes(attributes)
+            if image_path:
+                event_attributes['image_path'] = image_path
+            self.publish_unlock_event(doorbell, door_id, unlock_name, control_source_decoded, image_path=image_path)
+            logger.debug("Published unlock event attributes {}", event_attributes)
+
             door_sensor.on()
-            logger.debug("Doorbell updating sensor {}", door_sensor)
-            trigger = DeviceTriggerMetadata(name=f"Door unlocked", type="door open", subtype=f"door {door_id}", payload=attributes)
+            logger.debug("Doorbell updating relay switch {}", door_sensor)
+            trigger = DeviceTriggerMetadata(name=f"Door unlocked", type="door open", subtype=f"door {door_id+1}", payload=event_attributes)
             self.handle_device_trigger(doorbell, trigger)
 
             # Wait some seconds, then turn off the switch entity (since the door relay in the doorbell is momentary)
@@ -389,11 +804,13 @@ class MQTTHandler(EventHandler):
         
         match event_type:
             case VideoInterComEventType.UNLOCK_LOG:
+                if doorbell._type is not DeviceType.OUTDOOR:
+                    logger.debug("Ignoring unlock log on non-outdoor device {}", doorbell._config.name)
+                    return
+
                 door_id = alarm_info.uEventInfo.struUnlockRecord.wLockID
-                control_source = alarm_info.uEventInfo.struUnlockRecord.controlSource()
                 control_source_decoded = alarm_info.uEventInfo.struUnlockRecord.controlSource_decoded()
                 unlock_type = alarm_info.uEventInfo.struUnlockRecord.byUnlockType
-                card_user_id = alarm_info.uEventInfo.struUnlockRecord.dwCardUserID
 
                 try:
                     unlock_name = UnlockType(unlock_type).name
@@ -402,8 +819,16 @@ class MQTTHandler(EventHandler):
                     print(f"Unknown unlock type: {unlock_type}")
                     unlock_name = "Unknown"
 
-                
-                # card_number = alarm_info.uEventInfo.struAuthInfo.cardNo()
+                image_path = None
+                image_len = int(alarm_info.uEventInfo.struUnlockRecord.dwPicDataLen)
+                image_ptr = alarm_info.uEventInfo.struUnlockRecord.pImage
+                if image_len > 0 and image_ptr:
+                    try:
+                        image_bytes = string_at(image_ptr, image_len)
+                        image_path = self._save_unlock_event_image(doorbell, door_id, unlock_name, image_bytes)
+                    except Exception as e:
+                        logger.error("Failed to process unlock image for {}: {}", doorbell._config.name, e)
+
                 # Name of the entity inside the dict array containing all the sensors
                 entity_id = f'door_{door_id}'
                 # Extract the sensor entity from the dict and cast to know type
@@ -416,9 +841,9 @@ class MQTTHandler(EventHandler):
                     # logger.debug("Changing switches back to OFF position")
                     num_doors = doorbell.get_num_outputs()
                     for door_id in range(num_doors):
-                        await update_door_entities(door_id, control_source, control_source_decoded, unlock_name, card_user_id)
+                        await update_door_entities(door_id, unlock_name, control_source_decoded, image_path)
                     return
-                await update_door_entities(door_id, control_source, control_source_decoded, unlock_name, card_user_id)
+                await update_door_entities(door_id, unlock_name, control_source_decoded, image_path)
 
             case VideoInterComEventType.ILLEGAL_CARD_SWIPING_EVENT:
                 control_source = alarm_info.uEventInfo.struUnlockRecord.controlSource()
@@ -466,60 +891,31 @@ class MQTTHandler(EventHandler):
         match alarm_type:
             case VideoInterComAlarmType.DOORBELL_RINGING:
                 try:
+                    button_pressed = alarm_info.wLockID + 1
                     raw_bytes = bytes(alarm_info.byDevNumber)
                     dev_number = raw_bytes.split(b'\x00')[0].decode('utf-8')
                 except (UnicodeDecodeError, AttributeError, ValueError) as e:
                     dev_number = "unknown_device"
+                    button_pressed = "unknown_button"
                     logger.error(f"Error decoding device numbers: {e}")
-                logger.info("Doorbell ringing, button press from door: {} using button: {}, updating sensor", dev_number)
+                logger.info("Doorbell ringing, button press from door: {} using button: {}, updating sensor", dev_number, button_pressed)
                 logger.debug("Doorbell updating sensor {}", call_sensor)
                 attributes = {
-                    'device_number': dev_number,   
+                    'device_number': dev_number,
+                    'button_pressed': button_pressed
                 }
                 call_sensor.set_attributes(attributes)
-                call_sensor.set_state('ringing')
-
-                # Take snapshot and publish via MQTT
-                async def take_and_publish_snapshot():
-                    """Take snapshot and publish to MQTT"""
-                    try:
-                        # Import here to avoid circular imports
-                        from mqtt_input import get_mqtt_input
-                        
-                        # Take snapshot
-                        snapshot_path = doorbell.take_snapshot()
-                        
-                        if snapshot_path and os.path.exists(snapshot_path):
-                            # Get MQTTInput instance
-                            mqtt_input = get_mqtt_input()
-                            if mqtt_input:
-                                # Store the latest snapshot path
-                                mqtt_input._last_snapshot_paths[doorbell] = snapshot_path
-                                
-                                # Publish the image to MQTT
-                                mqtt_input._publish_snapshot_image(doorbell, snapshot_path)
-                                logger.info(f"Auto-snapshot published to MQTT: {snapshot_path}")
-                            else:
-                                logger.warning("MQTTInput not available, snapshot saved but not published: {}", snapshot_path)
-                        else:
-                            logger.warning("Auto-snapshot failed or file not created")
-                            
-                    except Exception as e:
-                        logger.error(f"Failed to take auto-snapshot: {e}")
-                
-                # Start the snapshot task without waiting for it
-                asyncio.create_task(take_and_publish_snapshot())
-
-                # After 60 seconds, put the sensor back to idle
-                await asyncio.sleep(60)
-                logger.info("Updating doorbell sensor back to 'idle' after 60 seconds")
-                call_sensor.set_state('idle')
+                call_sensor.set_state('ring')
+                previous_state = self._call_state_cache.get(doorbell, 'idle')
+                self._call_state_cache[doorbell] = 'ring'
+                await self._process_call_state_change(doorbell, previous_state, 'ring')
             case VideoInterComAlarmType.DISMISS_INCOMING_CALL:
                 logger.info("Call dismissed, updating sensor")
                 logger.debug("Doorbell updating sensor {}", call_sensor)
-                call_sensor.set_state('dismissed')
-                # Put sensor back to idle
+                previous_state = self._call_state_cache.get(doorbell, 'idle')
                 call_sensor.set_state('idle')
+                self._call_state_cache[doorbell] = 'idle'
+                await self._process_call_state_change(doorbell, previous_state, 'idle')
             case VideoInterComAlarmType.ZONE_ALARM:
                 #zone_name = str(alarm_info.uAlarmInfo.struZoneAlarm.byZoneName,'UTF-8')
                 zone_type_id = alarm_info.uAlarmInfo.struZoneAlarm.byZoneType
