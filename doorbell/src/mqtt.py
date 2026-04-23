@@ -637,6 +637,7 @@ class MQTTHandler(EventHandler):
             sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
 
         config_payload = {
+            "platform": "event",
             "name": f"{doorbell._config.name} {display_name}",
             "object_id": f"{sanitized_doorbell_name}_{event_key}",
             "unique_id": f"{device.identifiers}-{unique_suffix}",
