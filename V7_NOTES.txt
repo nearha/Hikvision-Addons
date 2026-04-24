@@ -1,1 +1,0 @@
-v7: bumped addon version to 3.0.38 and changed default outdoor_events to true. Existing saved options in Home Assistant may still retain false until edited.
