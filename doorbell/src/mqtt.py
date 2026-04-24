@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import unicodedata
 from ctypes import c_void_p, string_at
 from typing import Any, Optional, TypedDict, cast
 from config import AppConfig
@@ -54,6 +55,30 @@ class ActiveCallSession:
     unlock_performed: bool = False
     unlock_type: Optional[str] = None
     unlock_number: Optional[str] = None
+
+
+def normalize_entity_object_id(name: str) -> str:
+    if not name:
+        return ""
+    normalized = unicodedata.normalize("NFD", name.lower())
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return normalized
+
+
+def stable_event_device_key(doorbell: Doorbell, device: Optional[DeviceInfo] = None) -> str:
+    if device is not None and getattr(device, "identifiers", None):
+        key = normalize_entity_object_id(str(device.identifiers))
+        if key:
+            return key
+    return normalize_entity_object_id(doorbell._config.name)
+
+
+def event_entity_object_id(doorbell: Doorbell, suffix: str) -> str:
+    slug = normalize_entity_object_id(doorbell._config.name)
+    if not slug:
+        slug = "hikvision"
+    return f"event.{slug}_{suffix}"
 
 
 def extract_device_info(doorbell: Doorbell) -> DeviceInfo:
@@ -387,9 +412,8 @@ class MQTTHandler(EventHandler):
             except Exception as e:
                 logger.warning("Could not clear legacy MQTT discovery topic {}: {}", topic, e)
 
-    def _custom_event_device_discovery_topic(self, doorbell: Doorbell) -> str:
-        sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
-        return f"homeassistant/device/{sanitized_doorbell_name}/config"
+    def _custom_event_device_discovery_topic(self, doorbell: Doorbell, device: Optional[DeviceInfo] = None) -> str:
+        return f"homeassistant/device/{stable_event_device_key(doorbell, device)}/config"
 
 
     def _ensure_custom_event_device_discovery(
@@ -398,12 +422,12 @@ class MQTTHandler(EventHandler):
         device: Optional[DeviceInfo] = None,
         sanitized_doorbell_name: Optional[str] = None,
     ) -> None:
-        discovery_topic = self._custom_event_device_discovery_topic(doorbell)
+        if device is None:
+            device = extract_device_info(doorbell)
+        discovery_topic = self._custom_event_device_discovery_topic(doorbell, device)
         if discovery_topic in self._custom_event_device_discovery_topics:
             return
 
-        if device is None:
-            device = extract_device_info(doorbell)
         if sanitized_doorbell_name is None:
             sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
 
@@ -418,24 +442,24 @@ class MQTTHandler(EventHandler):
             },
             "origin": {
                 "name": "hikvision-doorbell-fork",
-                "sw_version": "3.0.45",
+                "sw_version": "3.0.46",
             },
             "components": {
                 "unlock_event": {
                     "platform": "event",
                     "name": f"{doorbell._config.name} Unlock",
-                    "default_entity_id": f"{sanitized_doorbell_name}_unlock",
+                    "default_entity_id": event_entity_object_id(doorbell, "unlock"),
                     "unique_id": f"{device.identifiers}-unlock_event",
-                    "state_topic": f"hikvision/{sanitized_doorbell_name}/unlock/event",
+                    "state_topic": self._event_topics(doorbell, "unlock")[1],
                     "event_types": [_UNLOCK_EVENT_TYPE],
                     "icon": "mdi:door-open",
                 },
                 "ring_event": {
                     "platform": "event",
                     "name": f"{doorbell._config.name} Ring",
-                    "default_entity_id": f"{sanitized_doorbell_name}_ring",
+                    "default_entity_id": event_entity_object_id(doorbell, "ring"),
                     "unique_id": f"{device.identifiers}-ring_event",
-                    "state_topic": f"hikvision/{sanitized_doorbell_name}/ring/event",
+                    "state_topic": self._event_topics(doorbell, "ring")[1],
                     "event_types": [_RING_EVENT_TYPE],
                     "icon": "mdi:bell-ring",
                     "device_class": "doorbell",
@@ -443,9 +467,9 @@ class MQTTHandler(EventHandler):
                 "call_event": {
                     "platform": "event",
                     "name": f"{doorbell._config.name} Call",
-                    "default_entity_id": f"{sanitized_doorbell_name}_call",
+                    "default_entity_id": event_entity_object_id(doorbell, "call"),
                     "unique_id": f"{device.identifiers}-call_event",
-                    "state_topic": f"hikvision/{sanitized_doorbell_name}/call/event",
+                    "state_topic": self._event_topics(doorbell, "call")[1],
                     "event_types": [_CALL_EVENT_TYPE],
                     "icon": "mdi:phone-in-talk",
                 },
@@ -725,9 +749,10 @@ class MQTTHandler(EventHandler):
         logger.info("Published unlock event for {} to {} with payload {}", doorbell._config.name, state_topic, payload)
 
     def _event_topics(self, doorbell: Doorbell, event_key: str) -> tuple[str, str]:
-        sanitized_doorbell_name = sanitize_doorbell_name(doorbell._config.name)
-        discovery_topic = f"homeassistant/device/{sanitized_doorbell_name}/config"
-        state_topic = f"hikvision/{sanitized_doorbell_name}/{event_key}/event"
+        device = extract_device_info(doorbell)
+        stable_key = stable_event_device_key(doorbell, device)
+        discovery_topic = f"homeassistant/device/{stable_key}/config"
+        state_topic = f"hikvision/{stable_key}/{event_key}/event"
         return discovery_topic, state_topic
 
     def com_switch_callback(self, client, user_data: tuple[Doorbell, int], message: MQTTMessage):
