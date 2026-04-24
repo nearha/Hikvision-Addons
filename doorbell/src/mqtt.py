@@ -176,6 +176,8 @@ class MQTTHandler(EventHandler):
         self._call_state_cache: dict[Doorbell, str] = {}
         self._active_call_sessions: dict[Doorbell, ActiveCallSession] = {}
         self._indoor_linked_outdoor_ip: dict[Doorbell, Optional[str]] = {}
+        self._caller_info_cache: dict[Doorbell, dict[str, Any]] = {}
+        self._outdoor_devno_by_ip: dict[str, int] = {}
         
         # Save the MQTT settings as an attribute
         self._mqtt_settings = Settings.MQTT(
@@ -231,6 +233,27 @@ class MQTTHandler(EventHandler):
             call_sensor.set_availability(True)
             self._sensors[doorbell]['call'] = call_sensor
 
+            live_call_sensor_info = SensorInfo(
+                name="Live call peer",
+                unique_id=f"{device.identifiers}-live_call_peer",
+                device=device,
+                default_entity_id=f"{sanitized_doorbell_name}_live_call_peer",
+                icon="mdi:account-voice")
+
+            live_call_settings = Settings(mqtt=self._mqtt_settings, entity=live_call_sensor_info, manual_availability=True)
+            live_call_sensor = Sensor(live_call_settings)
+            live_call_sensor.set_state("idle")
+            live_call_sensor.set_availability(True)
+            live_call_sensor.set_attributes({
+                "self_name": doorbell._config.name,
+                "call_state": "idle",
+                "peer_name": None,
+                "peer_names": [],
+                "peer_dev_no": None,
+                "peer_dev_type": None,
+            })
+            self._sensors[doorbell]['live_call_peer'] = live_call_sensor
+
             # Poll call state for all devices. If not configured, default to 1 second.
             call_state_poll_sec = doorbell._config.call_state_poll or _DEFAULT_CALL_STATE_POLL
 
@@ -251,6 +274,11 @@ class MQTTHandler(EventHandler):
                                 c.set_availability(True)
                                 c.set_state(call_state)
                                 self._call_state_cache[d] = call_state
+                                if call_state in _ACTIVE_CALL_STATES:
+                                    self._update_caller_info_cache(d)
+                                else:
+                                    self._caller_info_cache.pop(d, None)
+                                self._refresh_live_call_sensors()
                                 await self._process_call_state_change(d, previous_state, call_state)
                                 if previous_state != call_state:
                                     logger.info("Call sensor polling for : {} changed to {}", d._config.name, call_state)
@@ -607,6 +635,101 @@ class MQTTHandler(EventHandler):
             if state in _ACTIVE_CALL_STATES:
                 callers.append(self._normalize_caller_name(indoor._config.name))
         return callers
+
+    def _find_outdoor_by_ip(self, ip_address: Optional[str]) -> Optional[Doorbell]:
+        if not ip_address:
+            return None
+        for candidate in self._sensors.keys():
+            if candidate._type is DeviceType.OUTDOOR and candidate._config.ip == ip_address:
+                return candidate
+        return None
+
+    def _update_caller_info_cache(self, doorbell: Doorbell) -> Optional[dict[str, Any]]:
+        try:
+            response = doorbell._call_isapi("GET", "/ISAPI/VideoIntercom/callerInfo?format=json", "")
+            data = json.loads(response)
+            info = data.get("CallerInfo") if isinstance(data, dict) else None
+            if isinstance(info, dict):
+                self._caller_info_cache[doorbell] = info
+                if doorbell._type is not DeviceType.OUTDOOR:
+                    linked_ip = self._indoor_linked_outdoor_ip.get(doorbell)
+                    dev_no = info.get("devNo")
+                    dev_type = info.get("devType")
+                    if linked_ip and isinstance(dev_no, int) and dev_type in {1, 4, 5, 10}:
+                        self._outdoor_devno_by_ip[linked_ip] = dev_no
+                return info
+        except Exception as e:
+            logger.debug("Could not refresh callerInfo for {}: {}", doorbell._config.name, e)
+        self._caller_info_cache.pop(doorbell, None)
+        return None
+
+    def _describe_live_peer(self, doorbell: Doorbell) -> tuple[str, dict[str, Any]]:
+        call_state = self._call_state_cache.get(doorbell, "idle")
+        base_attrs: dict[str, Any] = {
+            "self_name": doorbell._config.name,
+            "call_state": call_state,
+            "peer_name": None,
+            "peer_names": [],
+            "peer_dev_no": None,
+            "peer_dev_type": None,
+            "role": "outdoor" if doorbell._type is DeviceType.OUTDOOR else "indoor",
+            "linked_outdoor_ip": self._indoor_linked_outdoor_ip.get(doorbell),
+            "resolution_source": "status",
+            "conversation": None,
+        }
+
+        if call_state not in _ACTIVE_CALL_STATES:
+            return "idle", base_attrs
+
+        caller_info = self._caller_info_cache.get(doorbell) or {}
+        if caller_info:
+            base_attrs["peer_dev_no"] = caller_info.get("devNo")
+            base_attrs["peer_dev_type"] = caller_info.get("devType")
+            base_attrs["raw_caller_info"] = caller_info
+
+        if doorbell._type is DeviceType.OUTDOOR:
+            active_indoors = []
+            for indoor in self._get_related_indoors(doorbell):
+                if self._call_state_cache.get(indoor, "idle") in _ACTIVE_CALL_STATES:
+                    active_indoors.append(indoor._config.name)
+            if active_indoors:
+                base_attrs["peer_names"] = active_indoors
+                base_attrs["peer_name"] = active_indoors[0] if len(active_indoors) == 1 else ", ".join(active_indoors)
+                base_attrs["resolution_source"] = "linked_indoor_status"
+            elif doorbell._config.ip in self._outdoor_devno_by_ip:
+                base_attrs["peer_name"] = f"devNo {self._outdoor_devno_by_ip[doorbell._config.ip]}"
+                base_attrs["resolution_source"] = "learned_devno"
+            elif base_attrs.get("peer_dev_no") is not None:
+                base_attrs["peer_name"] = f"devNo {base_attrs['peer_dev_no']}"
+                base_attrs["resolution_source"] = "caller_info"
+        else:
+            linked_outdoor = self._find_outdoor_by_ip(self._indoor_linked_outdoor_ip.get(doorbell))
+            if linked_outdoor is not None:
+                base_attrs["peer_name"] = linked_outdoor._config.name
+                base_attrs["peer_names"] = [linked_outdoor._config.name]
+                base_attrs["resolution_source"] = "linked_outdoor_ip"
+            elif base_attrs.get("peer_dev_no") is not None:
+                base_attrs["peer_name"] = f"devNo {base_attrs['peer_dev_no']}"
+                base_attrs["resolution_source"] = "caller_info"
+
+        if base_attrs.get("peer_name"):
+            base_attrs["conversation"] = f"{doorbell._config.name} -> {base_attrs['peer_name']}"
+            return str(base_attrs["peer_name"]), base_attrs
+
+        return call_state, base_attrs
+
+    def _refresh_live_call_sensors(self) -> None:
+        for device_doorbell, entities in self._sensors.items():
+            live_sensor = cast(Optional[Sensor], entities.get("live_call_peer"))
+            if live_sensor is None:
+                continue
+            state, attrs = self._describe_live_peer(device_doorbell)
+            try:
+                live_sensor.set_state(state)
+                live_sensor.set_attributes(self._drop_none(attrs))
+                live_sensor.set_availability(True)
+            except Exception as e:
+                logger.debug("Could not update live call sensor for {}: {}", device_doorbell._config.name, e)
 
     def publish_ring_event(
         self,
